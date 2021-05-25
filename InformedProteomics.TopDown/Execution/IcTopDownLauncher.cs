@@ -24,9 +24,12 @@ namespace InformedProteomics.TopDown.Execution
 {
     public class IcTopDownLauncher : EventNotifier
     {
-        // Ignore Spelling: deconvolute, deconvoluted, ic, Nums, pbf
+        // Ignore Spelling: deconvolute, deconvoluted, ic, Nums, pbf, Pre
 
         private const bool USE_PARALLEL_FOREACH = true;
+
+        private const bool DEBUG_MODE = false;
+        private const int DEBUG_MODE_PROTEINS_TO_SEARCH = 275;
 
         public const string TargetFileNameEnding = "_IcTarget.tsv";
         public const string DecoyFileNameEnding = "_IcDecoy.tsv";
@@ -239,7 +242,7 @@ namespace InformedProteomics.TopDown.Execution
             sw.Stop();
             OnStatusEvent(string.Format("Elapsed Time: {0:f1} sec", sw.Elapsed.TotalSeconds));
 
-            // pre-generate deconvoluted spectra for scoring
+            // Pre-generate deconvoluted spectra for scoring
             _massBinComparer = new FilteredProteinMassBinning(Options.AminoAcidSet, Options.MaxSequenceMass + 1000);
 
             //this.fragmentScorerFactory = new CompositionScorerFactory(_run, true);
@@ -326,7 +329,7 @@ namespace InformedProteomics.TopDown.Execution
             List<DatabaseSearchResultData> targetSearchResults = null;
 
             var validTargetResults = ResultsFileHasData(targetOutputFilePath);
-            if (Options.TargetDecoySearchMode.HasFlag(DatabaseSearchMode.Target) && !validTargetResults)
+            if (Options.TargetDecoySearchMode.HasFlag(DatabaseSearchMode.Target) && !validTargetResults || Options.OverwriteExistingResults)
             {
                 targetSearchResults = RunDatabaseSearch(targetDb, targetOutputFilePath, ms1Filter, "target", prog);
             }
@@ -339,7 +342,7 @@ namespace InformedProteomics.TopDown.Execution
             List<DatabaseSearchResultData> decoySearchResults = null;
 
             var validDecoyResults = ResultsFileHasData(decoyOutputFilePath);
-            if (Options.TargetDecoySearchMode.HasFlag(DatabaseSearchMode.Decoy) && !validDecoyResults)
+            if (Options.TargetDecoySearchMode.HasFlag(DatabaseSearchMode.Decoy) && !validDecoyResults || Options.OverwriteExistingResults)
             {
                 var decoyDb = targetDb.Decoy(null, true);
                 decoySearchResults = RunDatabaseSearch(decoyDb, decoyOutputFilePath, ms1Filter, "decoy", prog);
@@ -480,7 +483,7 @@ namespace InformedProteomics.TopDown.Execution
                 progData.Report(p.Percent);
             });
 
-            var bestMatchesByScan = RunGeneratingFunction(matches, null, progGen);
+            var bestMatchesByScan = RunGeneratingFunction(matches, searchDb, null, progGen);
 
             var results = WriteResultsToFile(bestMatchesByScan, outputFilePath, searchDb);
             sw.Stop();
@@ -620,17 +623,42 @@ namespace InformedProteomics.TopDown.Execution
 
             var maxNumNTermCleavages = Options.InternalCleavageMode == InternalCleavageType.NoInternalCleavage ? Options.MaxNumNTermCleavages : 0;
 
-            Parallel.ForEach(annotationsAndOffsets, pfeOptions, annotationAndOffset =>
+            if (USE_PARALLEL_FOREACH && !DEBUG_MODE)
             {
-                if (cancellationToken?.IsCancellationRequested == true)
+                Parallel.ForEach(annotationsAndOffsets, pfeOptions, annotationAndOffset =>
                 {
-                    //return matches;
-                    return;
-                }
+                    if (cancellationToken?.IsCancellationRequested == true)
+                    {
+                        //return matches;
+                        return;
+                    }
 
-                SearchProgressReport(ref numProteins, ref lastUpdate, estimatedProteins, sw, progData, matches);
-                SearchForMatches(annotationAndOffset, sequenceFilter, matches, maxNumNTermCleavages, db.IsDecoy, cancellationToken);
-            });
+                    SearchProgressReport(ref numProteins, ref lastUpdate, estimatedProteins, sw, progData, matches);
+                    SearchForMatches(annotationAndOffset, sequenceFilter, matches, maxNumNTermCleavages, db.IsDecoy, cancellationToken);
+                });
+            }
+            else
+            {
+                foreach(var annotationAndOffset in annotationsAndOffsets)
+                {
+                    if (cancellationToken?.IsCancellationRequested == true)
+                    {
+                        //return matches;
+                        return;
+                    }
+
+                    SearchProgressReport(ref numProteins, ref lastUpdate, estimatedProteins, sw, progData, matches);
+                    SearchForMatches(annotationAndOffset, sequenceFilter, matches, maxNumNTermCleavages, db.IsDecoy, cancellationToken);
+
+                    if (numProteins > DEBUG_MODE_PROTEINS_TO_SEARCH)
+                    {
+                        ConsoleMsgUtils.ShowWarning("Debug mode");
+                        ConsoleMsgUtils.ShowWarning(string.Format("Exiting ForEach since {0} proteins have been searched", DEBUG_MODE_PROTEINS_TO_SEARCH));
+                        Console.WriteLine();
+                        break;
+                    }
+                }
+            }
 
             OnStatusEvent(string.Format("Collected candidate matches: {0}", GetNumberOfMatches(matches)));
 
@@ -800,6 +828,7 @@ namespace InformedProteomics.TopDown.Execution
                         var pre = nTermCleavages == 0 ? annotation[0] : annotation[nTermCleavages + 1];
                         var post = annotation[annotation.Length - 1];
 
+                        // MS1 FeatureIds for MS2 scans
                         var ms2FeatureIds = new List<int>();
                         if (filter != null)
                         {
@@ -901,6 +930,7 @@ namespace InformedProteomics.TopDown.Execution
 
         private Dictionary<int, List<DatabaseSequenceSpectrumMatch>> RunGeneratingFunction(
             IReadOnlyList<SortedSet<DatabaseSequenceSpectrumMatch>> sortedMatches,
+            FastaDatabase searchDb,
             CancellationToken? cancellationToken = null,
             IProgress<ProgressData> progress = null)
         {
@@ -1065,6 +1095,15 @@ namespace InformedProteomics.TopDown.Execution
 
                         currentTask = "Reporting progress " + currentIteration;
                         SearchProgressReport(ref numProteins, ref lastUpdate, estimatedSequences, sw, progData, null);
+
+                        if (DEBUG_MODE && numProteins > DEBUG_MODE_PROTEINS_TO_SEARCH)
+                        {
+                            ConsoleMsgUtils.ShowWarning("Debug mode");
+                            ConsoleMsgUtils.ShowWarning(string.Format(
+                                "Exiting Parallel.ForEach since {0} proteins have been searched", DEBUG_MODE_PROTEINS_TO_SEARCH));
+                            Console.WriteLine();
+                            break;
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -1073,14 +1112,78 @@ namespace InformedProteomics.TopDown.Execution
                 }
             });
 
+            // Values in this SortedSet are Sequence_Modification_ProteinName
+            var storedSequences = new SortedSet<string>();
+
             // Keys in this dictionary are scan number
             // Values are the list of matches for each scan
             var finalMatches = new Dictionary<int, List<DatabaseSequenceSpectrumMatch>>();
 
             foreach (var scanNum in scanNums)
             {
-                var matchesForScan = matches[scanNum].OrderBy(m => m.SpecEvalue).Take(Options.MatchesPerSpectrumToReport).ToList();
-                finalMatches.Add(scanNum, matchesForScan);
+                var matchesForScan = matches[scanNum].OrderBy(m => m.SpecEvalue).ToList();
+
+                var matchesToStore = new List<DatabaseSequenceSpectrumMatch>();
+
+                storedSequences.Clear();
+
+                double comparisonSpecEValue = -1;
+                var ms1FeatureId = 0;
+
+                for (var i = 0; i < matchesForScan.Count; i++)
+                {
+                    // Multiple matches can have the same sequence, same protein, and same score
+                    // Typically they will have differing Offsets
+                    // Check for this and avoid duplicates
+
+                    var proteinName = searchDb.GetProteinName(matchesForScan[i].Offset);
+                    var sequenceKey = matchesForScan[i].Sequence + "_" + matchesForScan[i].ModificationText ?? string.Empty + "_" + proteinName;
+
+                    if (!storedSequences.Contains(sequenceKey))
+                    {
+                        matchesToStore.Add(matchesForScan[i]);
+                        storedSequences.Add(sequenceKey);
+                    }
+
+                    if (matchesToStore.Count < Options.MatchesPerSpectrumToReport)
+                    {
+                        continue;
+                    }
+
+                    if (ms1FeatureId == 0 && matchesForScan[i].FeatureId > 0)
+                    {
+                        ms1FeatureId = matchesForScan[i].FeatureId;
+                    }
+
+                    if (i == matchesForScan.Count - 1)
+                    {
+                        // No more matches
+                        break;
+                    }
+
+                    if (i == 0)
+                    {
+                        comparisonSpecEValue = matchesForScan[0].SpecEvalue;
+                    }
+
+                    // Compare the next lowest scoring match's score to the comparison Spec EValue
+                    if (Math.Abs(comparisonSpecEValue - matchesForScan[i + 1].SpecEvalue) > double.Epsilon)
+                    {
+                        // Scores are sufficiently different
+                        break;
+                    }
+                }
+
+                // If any of the matches have a FeatureId of 0, change it to ms1FeatureId
+                foreach (var match in matchesToStore)
+                {
+                    if (match.FeatureId == 0)
+                    {
+                        match.UpdateFeatureId(ms1FeatureId);
+                    }
+                }
+
+                finalMatches.Add(scanNum, matchesToStore);
             }
 
             progData.StatusInternal = string.Empty;
